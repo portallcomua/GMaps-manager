@@ -1,16 +1,16 @@
 <?php
 /**
  * Plugin Name: GMaps Client Manager
- * Description: CRM for Google Business Profile managers: clients, orders, payments, commissions and payouts.
- * Version: 1.2.0
+ * Description: Client intake and manager workflow for Google Business Profile services.
+ * Version: 1.4.0
  * Author: UAserver
  * Text Domain: gmaps-client-manager
  */
 if (!defined('ABSPATH')) exit;
 
 final class GMaps_Client_Manager {
-    const VERSION = '1.2.0';
-    const DB_VERSION = '1.2';
+    const VERSION = '1.4.0';
+    const DB_VERSION = '1.4';
     const ROLE = 'gmaps_manager';
     const OPT = 'gcm_settings';
     private static $instance = null;
@@ -38,11 +38,16 @@ final class GMaps_Client_Manager {
         add_action('admin_menu', array($this, 'admin_menu'));
         add_action('admin_init', array($this, 'register_settings'));
         add_action('admin_post_gcm_action', array($this, 'handle_admin_action'));
+        add_action('admin_post_gcm_google_admin_connect', array($this, 'start_google_admin_connect'));
         add_action('wp_ajax_gcm_lookup_email', array($this, 'ajax_lookup_email'));
-        add_action('admin_post_nopriv_gcm_google_callback', array($this, 'google_callback'));
+        add_action('wp_ajax_gcm_check_place', array($this, 'ajax_check_place'));
+        add_action('wp_ajax_nopriv_gcm_check_place', array($this, 'ajax_check_place'));
+        add_action('admin_post_gcm_submit_request', array($this, 'submit_request'));
+        add_action('admin_post_nopriv_gcm_submit_request', array($this, 'submit_request'));
         add_action('admin_post_gcm_google_callback', array($this, 'google_callback'));
         add_shortcode('gmaps_client_manager', array($this, 'shortcode'));
         add_shortcode('gmaps_manager_link', array($this, 'manager_link_shortcode'));
+        add_shortcode('gmaps_request_form', array($this, 'request_form_shortcode'));
         add_action('wp_enqueue_scripts', array($this, 'assets'));
     }
 
@@ -128,6 +133,26 @@ final class GMaps_Client_Manager {
             PRIMARY KEY  (id),
             KEY manager_id (manager_id)
         ) $charset;");
+        $r = $wpdb->prefix . 'gcm_requests';
+        dbDelta("CREATE TABLE $r (
+            id bigint(20) unsigned NOT NULL AUTO_INCREMENT,
+            customer_email varchar(190) NOT NULL,
+            manager_email varchar(190) NOT NULL,
+            manager_id bigint(20) unsigned NOT NULL DEFAULT 0,
+            business_name varchar(190) NOT NULL,
+            business_address varchar(255) NOT NULL DEFAULT '',
+            maps_url text NULL,
+            place_id varchar(190) NOT NULL DEFAULT '',
+            request_type varchar(30) NOT NULL DEFAULT 'create',
+            status varchar(30) NOT NULL DEFAULT 'new',
+            last_error text NULL,
+            notes text NULL,
+            media longtext NULL,
+            created_at datetime NOT NULL,
+            PRIMARY KEY  (id),
+            KEY manager_id (manager_id),
+            KEY status (status)
+        ) $charset;");
         update_option('gcm_db_version', self::DB_VERSION);
     }
 
@@ -144,9 +169,16 @@ final class GMaps_Client_Manager {
     }
 
     private function money($n) { return number_format((float)$n, 2, '.', ' ') . ' ' . esc_html(get_option('gcm_currency', 'грн')); }
-    private function is_manager() {
+    private function has_manager_role() {
         $u = wp_get_current_user();
         return is_user_logged_in() && (current_user_can('manage_options') || in_array(self::ROLE, (array)$u->roles, true));
+    }
+    private function is_manager() {
+        $u = wp_get_current_user();
+        if (!is_user_logged_in()) return false;
+        if ($this->has_manager_role()) return true;
+        global $wpdb;
+        return (bool)$wpdb->get_var($wpdb->prepare("SELECT id FROM {$wpdb->prefix}gcm_requests WHERE manager_email=%s LIMIT 1", $u->user_email));
     }
     private function is_admin_user() { return current_user_can('manage_options'); }
     private function notice($msg, $type='info') { return '<div class="gcm-alert">'.esc_html($msg).'</div>'; }
@@ -156,7 +188,7 @@ final class GMaps_Client_Manager {
         wp_safe_redirect($url); exit;
     }
     private function verify_front() {
-        if (!is_user_logged_in() || !$this->is_manager()) wp_die('Доступ заборонено.');
+        if (!$this->has_manager_role()) wp_die('Доступ заборонено.');
         if (empty($_POST['_wpnonce']) || !wp_verify_nonce(sanitize_text_field(wp_unslash($_POST['_wpnonce'])), 'gcm_front')) wp_die('Перевірка безпеки не пройдена.');
     }
 
@@ -174,9 +206,262 @@ final class GMaps_Client_Manager {
         return $this->dashboard_html();
     }
 
+    private function request_only_dashboard_html($requests) {
+        ob_start(); ?>
+        <div class="gcm-wrap">
+          <h2>Ваші заявки GMaps</h2>
+          <p class="gcm-muted">Увійшли як <?php echo esc_html(wp_get_current_user()->user_email); ?> · <a href="<?php echo esc_url(wp_logout_url(home_url('/gmaps/'))); ?>">Вийти</a></p>
+          <table class="gcm-table"><thead><tr><th>Бізнес</th><th>Тип</th><th>Карта</th><th>Коментар</th><th>Матеріали</th><th>Статус</th></tr></thead><tbody>
+          <?php if($requests) foreach($requests as $request): ?><tr><td><?php echo esc_html($request->business_name.' '.$request->business_address); ?></td><td><?php echo esc_html($request->request_type==='edit'?'Редагування':'Створення'); ?></td><td><?php if($request->maps_url): ?><a href="<?php echo esc_url($request->maps_url); ?>" target="_blank" rel="noopener">Відкрити карту</a><?php endif; ?></td><td><?php echo esc_html($request->notes); ?></td><td><?php echo $this->request_attachments($request->media); ?></td><td><?php echo esc_html($this->request_status_label($request->status)); ?></td></tr><?php endforeach; ?>
+          <?php if(!$requests) echo '<tr><td colspan="6">Заявок поки немає.</td></tr>'; ?></tbody></table>
+        </div>
+        <?php return ob_get_clean();
+    }
+
     public function manager_link_shortcode() {
         $url = is_user_logged_in() ? home_url('/gmaps/') : wp_login_url(home_url('/gmaps/'));
         return '<a class="gcm-btn" href="'.esc_url($url).'">Кабінет менеджера</a>';
+    }
+
+    public function request_form_shortcode() {
+        $message = isset($_GET['gcm_request']) ? sanitize_key(wp_unslash($_GET['gcm_request'])) : '';
+        if ($message === 'sent') return '<div class="gcm-wrap"><p class="gcm-alert">Заявку надіслано. Менеджер зв’яжеться з вами після перевірки.</p></div>';
+        $ajax_url = admin_url('admin-ajax.php');
+        $nonce = wp_create_nonce('gcm_place_check');
+        ob_start(); ?>
+        <div class="gcm-wrap">
+          <h2>Заявка на створення або редагування Google Maps</h2>
+          <form method="post" action="<?php echo esc_url(admin_url('admin-post.php')); ?>" enctype="multipart/form-data" id="gcm-request-form">
+            <input type="hidden" name="action" value="gcm_submit_request">
+            <?php wp_nonce_field('gcm_submit_request'); ?>
+            <div class="gcm-grid">
+              <label>Ваш email<input type="email" name="customer_email" required></label>
+              <label>Email менеджера<input type="email" name="manager_email" required></label>
+              <label>Назва бізнесу<input type="text" name="business_name" id="gcm-business-name"></label>
+              <label>Адреса бізнесу<input type="text" name="business_address" id="gcm-business-address"></label>
+            </div>
+            <label>Посилання на Google Maps або Place ID<input type="text" name="maps_url" id="gcm-maps-url" placeholder="Необов’язково, якщо вказали назву й адресу"></label>
+            <button type="button" id="gcm-check-place">Перевірити карту</button>
+            <p class="gcm-muted" id="gcm-place-result" aria-live="polite">Якщо ви вже подавали заявку з цього email, перевіримо збережену карту. Для нової заявки вкажіть також назву/адресу або посилання на Google Maps.</p>
+            <input type="hidden" name="place_checked" id="gcm-place-checked" value="0">
+            <input type="hidden" name="place_id" id="gcm-place-id" value="">
+            <input type="hidden" name="request_type" id="gcm-request-type" value="">
+                        <div class="gcm-grid">
+                            <label>Зробити фото<input type="file" name="gcm_photos[]" accept="image/*" capture="environment" multiple></label>
+                            <label>Зняти відео<input type="file" name="gcm_videos[]" accept="video/*" capture="environment" multiple></label>
+                            <label>Вибрати фото/відео з пристрою<input type="file" name="gcm_media[]" accept="image/*,video/*" multiple></label>
+                        </div>
+            <label>Коментар<textarea name="notes" rows="3"></textarea></label>
+            <button type="submit" id="gcm-submit-request" disabled>Надіслати заявку</button>
+          </form>
+        </div>
+        <script>
+        (function(){
+          var form=document.getElementById('gcm-request-form'),button=document.getElementById('gcm-check-place'),result=document.getElementById('gcm-place-result');
+          var checked=document.getElementById('gcm-place-checked'),placeId=document.getElementById('gcm-place-id'),type=document.getElementById('gcm-request-type'),submit=document.getElementById('gcm-submit-request');
+          function resetCheck(){checked.value='0';placeId.value='';type.value='';submit.disabled=true;}
+          form.addEventListener('input',resetCheck);
+          button.addEventListener('click',function(){
+            var data=new FormData();data.append('action','gcm_check_place');data.append('_ajax_nonce','<?php echo esc_js($nonce); ?>');
+            data.append('email',form.elements.customer_email.value);data.append('name',form.elements.business_name.value);
+            data.append('address',form.elements.business_address.value);data.append('maps_url',form.elements.maps_url.value);
+            result.textContent='Перевіряю Google Maps…';button.disabled=true;
+            fetch('<?php echo esc_url($ajax_url); ?>',{method:'POST',credentials:'same-origin',body:data}).then(function(response){return response.json();}).then(function(response){
+              if(!response.success)throw new Error(response.data&&response.data.message?response.data.message:'Не вдалося перевірити карту.');
+              checked.value='1';submit.disabled=false;
+              if(response.data.found){placeId.value=response.data.place_id;type.value='edit';result.textContent='Знайдено: '+response.data.name+(response.data.address?', '+response.data.address:'')+'. Заявка буде на редагування.';}
+              else{type.value='create';result.textContent='Картку не знайдено. Заявка буде на створення нової сторінки.';}
+            }).catch(function(error){result.textContent=error.message;resetCheck();}).finally(function(){button.disabled=false;});
+          });
+          form.addEventListener('submit',function(event){if(checked.value!=='1'){event.preventDefault();result.textContent='Спочатку перевірте карту.';}});
+        })();
+        </script>
+        <?php return ob_get_clean();
+    }
+
+    public function ajax_check_place() {
+        check_ajax_referer('gcm_place_check');
+        $email = sanitize_email(wp_unslash($_POST['email'] ?? ''));
+        if (!is_email($email)) wp_send_json_error(array('message'=>'Вкажіть коректний email.'), 400);
+        $client_ip = sanitize_text_field(wp_unslash($_SERVER['REMOTE_ADDR'] ?? 'unknown'));
+        $limit_key = 'gcm_place_limit_' . md5($client_ip);
+        $request_count = (int)get_transient($limit_key);
+        if ($request_count >= 20) wp_send_json_error(array('message'=>'Забагато перевірок. Спробуйте пізніше.'), 429);
+        set_transient($limit_key, $request_count + 1, 10 * MINUTE_IN_SECONDS);
+        $name = sanitize_text_field(wp_unslash($_POST['name'] ?? ''));
+        $address = sanitize_text_field(wp_unslash($_POST['address'] ?? ''));
+        $maps_url = sanitize_text_field(wp_unslash($_POST['maps_url'] ?? ''));
+        $query = $maps_url ?: trim($name . ' ' . $address);
+        if (!$query) {
+            global $wpdb;
+            $query = (string)$wpdb->get_var($wpdb->prepare("SELECT place_id FROM {$wpdb->prefix}gcm_requests WHERE customer_email=%s AND place_id<>'' ORDER BY id DESC LIMIT 1", $email));
+            if (!$query) wp_send_json_error(array('message'=>'Для першої заявки введіть назву й адресу бізнесу або посилання на Google Maps.'), 400);
+        }
+        $place = $this->lookup_google_place($query);
+        if (is_wp_error($place)) wp_send_json_error(array('message'=>$place->get_error_message()), 502);
+        if (!$place) wp_send_json_success(array('found'=>false));
+        wp_send_json_success(array(
+            'found'=>true,
+            'place_id'=>sanitize_text_field($place['id'] ?? ''),
+            'name'=>sanitize_text_field($place['displayName']['text'] ?? $name),
+            'address'=>sanitize_text_field($place['formattedAddress'] ?? $address),
+        ));
+    }
+
+    private function lookup_google_place($query) {
+        $settings = get_option(self::OPT, array());
+        $api_key = trim($settings['places_api_key'] ?? '');
+        if (!$api_key) return new WP_Error('gcm_places_key', 'Адміністратор ще не додав Google Places API key.');
+        $place_id = '';
+        if (preg_match('/(?:query_place_id|place_id)=([^&]+)/i', $query, $match) || preg_match('/!1s(ChIJ[A-Za-z0-9_-]+)/', $query, $match)) {
+            $place_id = sanitize_text_field(rawurldecode($match[1]));
+        } elseif (preg_match('/^ChIJ[A-Za-z0-9_-]+$/', $query)) {
+            $place_id = $query;
+        }
+        $headers = array('X-Goog-Api-Key'=>$api_key, 'X-Goog-FieldMask'=>'id,displayName,formattedAddress,googleMapsUri');
+        if ($place_id) {
+            $response = wp_remote_get('https://places.googleapis.com/v1/places/' . rawurlencode($place_id), array('timeout'=>15, 'headers'=>$headers));
+        } else {
+            $search = $query;
+            if (filter_var($query, FILTER_VALIDATE_URL)) {
+                $parts = wp_parse_url($query);
+                parse_str($parts['query'] ?? '', $query_args);
+                $search = sanitize_text_field($query_args['query'] ?? $query_args['q'] ?? '');
+                if (!$search && !empty($parts['path']) && preg_match('~/maps/place/([^/@]+)~', $parts['path'], $match)) $search = str_replace('+', ' ', rawurldecode($match[1]));
+                if (!$search) return new WP_Error('gcm_maps_link', 'Не вдалося прочитати місце з посилання. Введіть назву та адресу бізнесу.');
+            }
+            $response = wp_remote_post('https://places.googleapis.com/v1/places:searchText', array(
+                'timeout'=>15,
+                'headers'=>array_merge($headers, array('Content-Type'=>'application/json')),
+                'body'=>wp_json_encode(array('textQuery'=>$search, 'languageCode'=>'uk')),
+            ));
+        }
+        if (is_wp_error($response)) return new WP_Error('gcm_places_request', 'Google Maps не відповів. Спробуйте ще раз.');
+        $code = wp_remote_retrieve_response_code($response);
+        $body = json_decode(wp_remote_retrieve_body($response), true);
+        if ($code < 200 || $code >= 300) return new WP_Error('gcm_places_api', 'Google Places API відхилив запит. Перевірте API key, Places API та billing у Google Cloud.');
+        if ($place_id) return !empty($body['id']) ? $body : null;
+        return !empty($body['places'][0]) ? $body['places'][0] : null;
+    }
+
+    private function google_admin_access_token() {
+        $token = get_option('gcm_google_admin_token', array());
+        if (!empty($token['access_token']) && !empty($token['expires_at']) && (int)$token['expires_at'] > time() + 60) return $token['access_token'];
+        if (empty($token['refresh_token'])) return new WP_Error('gcm_google_auth', 'Спочатку підключіть центральний Google-акаунт у налаштуваннях плагіна.');
+        $settings = get_option(self::OPT, array());
+        $response = wp_remote_post('https://oauth2.googleapis.com/token', array('timeout'=>20, 'body'=>array(
+            'client_id'=>$settings['client_id'] ?? '',
+            'client_secret'=>$settings['client_secret'] ?? '',
+            'refresh_token'=>$token['refresh_token'],
+            'grant_type'=>'refresh_token',
+        )));
+        if (is_wp_error($response)) return new WP_Error('gcm_google_refresh', 'Не вдалося оновити Google-доступ. Перепідключіть акаунт адміністратора.');
+        $body = json_decode(wp_remote_retrieve_body($response), true);
+        if (empty($body['access_token'])) return new WP_Error('gcm_google_refresh', 'Google відхилив оновлення доступу. Перепідключіть акаунт адміністратора.');
+        $token['access_token'] = $body['access_token'];
+        $token['expires_at'] = time() + absint($body['expires_in'] ?? 3600);
+        update_option('gcm_google_admin_token', $token, false);
+        return $token['access_token'];
+    }
+
+    private function google_location_id_for_place($place_id, $access_token) {
+        $accounts_url = 'https://mybusinessaccountmanagement.googleapis.com/v1/accounts';
+        do {
+            $accounts_response = wp_remote_get($accounts_url, array('timeout'=>20, 'headers'=>array('Authorization'=>'Bearer ' . $access_token)));
+            if (is_wp_error($accounts_response)) return new WP_Error('gcm_accounts', 'Не вдалося отримати список Google Business Profile акаунтів.');
+            $accounts_body = json_decode(wp_remote_retrieve_body($accounts_response), true);
+            if (wp_remote_retrieve_response_code($accounts_response) >= 300) return new WP_Error('gcm_accounts', $accounts_body['error']['message'] ?? 'Google не повернув список акаунтів.');
+            foreach (($accounts_body['accounts'] ?? array()) as $account) {
+                if (empty($account['name'])) continue;
+                $locations_url = 'https://mybusinessbusinessinformation.googleapis.com/v1/' . $account['name'] . '/locations';
+                $locations_url = add_query_arg(array('readMask'=>'name,metadata.placeId', 'pageSize'=>100), $locations_url);
+                do {
+                    $locations_response = wp_remote_get($locations_url, array('timeout'=>20, 'headers'=>array('Authorization'=>'Bearer ' . $access_token)));
+                    if (is_wp_error($locations_response)) break;
+                    $locations_body = json_decode(wp_remote_retrieve_body($locations_response), true);
+                    if (wp_remote_retrieve_response_code($locations_response) >= 300) break;
+                    foreach (($locations_body['locations'] ?? array()) as $location) {
+                        if (($location['metadata']['placeId'] ?? '') === $place_id && !empty($location['name'])) {
+                            $parts = explode('/', $location['name']);
+                            return end($parts);
+                        }
+                    }
+                    $locations_url = !empty($locations_body['nextPageToken']) ? add_query_arg('pageToken', $locations_body['nextPageToken'], $locations_url) : '';
+                } while ($locations_url);
+            }
+            $accounts_url = !empty($accounts_body['nextPageToken']) ? add_query_arg('pageToken', $accounts_body['nextPageToken'], 'https://mybusinessaccountmanagement.googleapis.com/v1/accounts') : '';
+        } while ($accounts_url);
+        return new WP_Error('gcm_location_not_managed', 'Цю карту не знайдено серед локацій центрального Google-акаунта. Перевірте, що акаунт має до неї доступ.');
+    }
+
+    private function send_google_location_invitation($place_id, $manager_email) {
+        $access_token = $this->google_admin_access_token();
+        if (is_wp_error($access_token)) return $access_token;
+        $location_id = $this->google_location_id_for_place($place_id, $access_token);
+        if (is_wp_error($location_id)) return $location_id;
+        $url = 'https://mybusinessaccountmanagement.googleapis.com/v1/locations/' . rawurlencode($location_id) . '/admins';
+        $response = wp_remote_post($url, array(
+            'timeout'=>20,
+            'headers'=>array('Authorization'=>'Bearer ' . $access_token, 'Content-Type'=>'application/json'),
+            'body'=>wp_json_encode(array('admin'=>$manager_email, 'role'=>'MANAGER')),
+        ));
+        if (is_wp_error($response)) return new WP_Error('gcm_invitation', 'Не вдалося надіслати запрошення Google.');
+        $body = json_decode(wp_remote_retrieve_body($response), true);
+        if (wp_remote_retrieve_response_code($response) >= 300) return new WP_Error('gcm_invitation', $body['error']['message'] ?? 'Google відхилив запрошення.');
+        return true;
+    }
+
+    public function submit_request() {
+        if (empty($_POST['_wpnonce']) || !wp_verify_nonce(sanitize_text_field(wp_unslash($_POST['_wpnonce'])), 'gcm_submit_request')) wp_die('Перевірка безпеки не пройдена.');
+        global $wpdb;
+        $customer_email = sanitize_email(wp_unslash($_POST['customer_email'] ?? ''));
+        $manager_email = sanitize_email(wp_unslash($_POST['manager_email'] ?? ''));
+        $business_name = sanitize_text_field(wp_unslash($_POST['business_name'] ?? ''));
+        $business_address = sanitize_text_field(wp_unslash($_POST['business_address'] ?? ''));
+        $maps_url = sanitize_text_field(wp_unslash($_POST['maps_url'] ?? ''));
+        if (!is_email($customer_email) || !is_email($manager_email) || empty($_POST['place_checked'])) wp_die('Перевірте email та спочатку виконайте пошук карти.');
+        $submitted_place_id = sanitize_text_field(wp_unslash($_POST['place_id'] ?? ''));
+        $place_query = $submitted_place_id ?: ($maps_url ?: trim($business_name . ' ' . $business_address));
+        if (!$place_query) {
+            $place_query = (string)$wpdb->get_var($wpdb->prepare("SELECT place_id FROM {$wpdb->prefix}gcm_requests WHERE customer_email=%s AND place_id<>'' ORDER BY id DESC LIMIT 1", $customer_email));
+        }
+        $place = $this->lookup_google_place($place_query);
+        if (is_wp_error($place)) wp_die(esc_html($place->get_error_message()));
+        if (!$business_name && $place) $business_name = sanitize_text_field($place['displayName']['text'] ?? '');
+        if (!$business_name) wp_die('Для нової карти введіть назву бізнесу.');
+        $request_type = $place ? 'edit' : 'create';
+        $client_ip = sanitize_text_field(wp_unslash($_SERVER['REMOTE_ADDR'] ?? 'unknown'));
+        $limit_key = 'gcm_submit_limit_' . md5($client_ip);
+        $request_count = (int)get_transient($limit_key);
+        if ($request_count >= 5) wp_die('Забагато заявок. Спробуйте пізніше.');
+        set_transient($limit_key, $request_count + 1, HOUR_IN_SECONDS);
+        $media_ids = $this->upload_order_media(array('gcm_photos', 'gcm_videos', 'gcm_media'));
+        if (is_wp_error($media_ids)) wp_die(esc_html($media_ids->get_error_message()));
+        $manager = get_user_by('email', $manager_email);
+        $manager_id = ($manager && (in_array(self::ROLE, (array)$manager->roles, true) || user_can($manager, 'manage_options'))) ? (int)$manager->ID : 0;
+        $inserted = $wpdb->insert($wpdb->prefix . 'gcm_requests', array(
+            'customer_email'=>$customer_email,
+            'manager_email'=>$manager_email,
+            'manager_id'=>$manager_id,
+            'business_name'=>$business_name,
+            'business_address'=>$business_address,
+            'maps_url'=>$place['googleMapsUri'] ?? $maps_url,
+            'place_id'=>$place['id'] ?? '',
+            'request_type'=>$request_type,
+            'status'=>$request_type === 'edit' ? 'pending_review' : 'needs_creation',
+            'notes'=>sanitize_textarea_field(wp_unslash($_POST['notes'] ?? '')),
+            'media'=>wp_json_encode($media_ids),
+            'created_at'=>current_time('mysql'),
+        ));
+        if (!$inserted) {
+            $this->discard_order_media($media_ids);
+            wp_die('Не вдалося зберегти заявку. Спробуйте ще раз.');
+        }
+        wp_mail($manager_email, 'Нова заявка GMaps', "Клієнт: {$customer_email}\nБізнес: {$business_name}\nТип: " . ($request_type === 'edit' ? 'редагування' : 'створення') . "\nПерегляньте заявку у кабінеті GMaps Manager.");
+        wp_mail(get_option('admin_email'), 'Нова заявка GMaps', "Клієнт: {$customer_email}\nМенеджер: {$manager_email}\nБізнес: {$business_name}\nТип: " . ($request_type === 'edit' ? 'редагування' : 'створення') . "\nПеревірте заявку в GMaps Manager.");
+        $redirect = wp_get_referer() ?: home_url('/');
+        wp_safe_redirect(add_query_arg('gcm_request', 'sent', $redirect));
+        exit;
     }
 
     private function dashboard_html() {
@@ -186,7 +471,10 @@ final class GMaps_Client_Manager {
         }
         if (!$this->is_manager()) return '<div class="gcm-wrap">Ваш обліковий запис не має ролі GMaps Manager.</div>';
         global $wpdb;
-        $uid = get_current_user_id(); $c=$this->tables['clients']; $o=$this->tables['orders']; $p=$this->tables['payments'];
+        $uid = get_current_user_id();
+        $requests = $wpdb->get_results($wpdb->prepare("SELECT * FROM {$wpdb->prefix}gcm_requests WHERE manager_id=%d OR manager_email=%s ORDER BY id DESC", $uid, wp_get_current_user()->user_email));
+        if (!$this->has_manager_role()) return $this->request_only_dashboard_html($requests);
+        $c=$this->tables['clients']; $o=$this->tables['orders']; $p=$this->tables['payments'];
         $clients = $wpdb->get_results($wpdb->prepare("SELECT * FROM $c WHERE manager_id=%d ORDER BY id DESC", $uid));
         $orders = $wpdb->get_results($wpdb->prepare("SELECT o.*,c.name client_name FROM $o o LEFT JOIN $c c ON c.id=o.client_id WHERE o.manager_id=%d ORDER BY o.id DESC", $uid));
             $payments = $wpdb->get_results($wpdb->prepare("SELECT p.*,o.service,c.name client_name FROM {$this->tables['payments']} p LEFT JOIN {$this->tables['orders']} o ON o.id=p.order_id LEFT JOIN $c c ON c.id=o.client_id WHERE p.manager_id=%d ORDER BY p.id DESC", $uid));
@@ -201,8 +489,11 @@ final class GMaps_Client_Manager {
           <p class="gcm-muted">Вітаємо, <?php echo esc_html(wp_get_current_user()->display_name); ?> · <a href="<?php echo esc_url(wp_logout_url(home_url('/gmaps/'))); ?>">Вийти</a></p>
           <?php if($msg) echo $this->notice($msg); ?>
                     <nav class="gcm-tabs" aria-label="Розділи кабінету">
-                        <a href="#gcm-order">Нове замовлення</a><a href="#gcm-clients">Клієнти</a><a href="#gcm-orders">Замовлення</a>
+                                                <a href="#gcm-requests">Мої заявки</a><a href="#gcm-order">Нове замовлення</a><a href="#gcm-clients">Клієнти</a><a href="#gcm-orders">Замовлення</a>
                     </nav>
+                    <div class="gcm-box" id="gcm-requests"><h3>Мої заявки клієнтів</h3><table class="gcm-table"><thead><tr><th>Клієнт</th><th>Бізнес</th><th>Тип</th><th>Карта</th><th>Коментар</th><th>Матеріали</th><th>Статус</th></tr></thead><tbody>
+                        <?php if($requests) foreach($requests as $request): ?><tr><td><?php echo esc_html($request->customer_email); ?></td><td><?php echo esc_html($request->business_name.' '.$request->business_address); ?></td><td><?php echo esc_html($request->request_type==='edit'?'Редагування':'Створення'); ?></td><td><?php if($request->maps_url): ?><a href="<?php echo esc_url($request->maps_url); ?>" target="_blank" rel="noopener">Відкрити карту</a><?php endif; ?></td><td><?php echo esc_html($request->notes); ?></td><td><?php echo $this->request_attachments($request->media); ?></td><td><?php echo esc_html($this->request_status_label($request->status)); ?></td></tr><?php endforeach; ?>
+                        <?php if(!$requests) echo '<tr><td colspan="7">Заявок поки немає.</td></tr>'; ?></tbody></table></div>
           <div class="gcm-grid">
             <div class="gcm-box"><strong>Клієнтів</strong><h2><?php echo count($clients); ?></h2></div>
             <div class="gcm-box"><strong>Підтверджені комісії</strong><h2><?php echo $this->money($earned); ?></h2></div>
@@ -258,12 +549,7 @@ final class GMaps_Client_Manager {
                                 <?php if(!$payments) echo '<tr><td colspan="6">Оплат поки немає.</td></tr>'; ?></tbody></table></div>
                         <?php if($orders) foreach($orders as $ord): ?><tr><td><?php echo (int)$ord->id; ?></td><td><?php echo esc_html($ord->client_name); ?></td><td><?php echo esc_html($ord->service); ?></td><td><?php echo $this->money($ord->amount); ?></td><td><?php echo esc_html($ord->commission_rate); ?>%</td><td><?php echo esc_html($ord->status); ?></td><td><?php $media_ids=json_decode($ord->media, true); if(is_array($media_ids)) foreach($media_ids as $index=>$media_id): $media_url=wp_get_attachment_url(absint($media_id)); if($media_url): ?><a href="<?php echo esc_url($media_url); ?>" target="_blank" rel="noopener">Файл <?php echo (int)($index+1); ?></a><?php endif; endforeach; ?></td></tr><?php endforeach; ?>
                         <?php if(!$orders) echo '<tr><td colspan="7">Замовлень поки немає.</td></tr>'; ?></tbody></table></div>
-          <div class="gcm-box"><h3>Google Business Profile</h3>
-            <p>Google-пошта клієнта зберігається в картці клієнта. Для підключення Google OAuth адміністратор має налаштувати центральні Client ID та Client Secret у параметрах плагіна. Пароль Google клієнта або менеджера не запитується.</p>
-            <?php $settings=get_option(self::OPT,array()); if(!empty($settings['client_id'])): ?>
-              <a class="gcm-btn" href="<?php echo esc_url($this->google_auth_url($uid)); ?>">Підключити Google-акаунт менеджера</a>
-            <?php else: ?><p class="gcm-muted">Підключення ще не налаштоване адміністратором.</p><?php endif; ?>
-          </div>
+                    <div class="gcm-box"><h3>Доступ до Google</h3><p class="gcm-muted">Google-доступ налаштовує адміністратор один раз. Менеджерам окремо підключати Google-акаунт не потрібно.</p></div>
         </div>
         <?php
         return ob_get_clean();
@@ -307,7 +593,7 @@ final class GMaps_Client_Manager {
     }
 
     public function ajax_lookup_email() {
-        if (!is_user_logged_in() || !$this->is_manager()) wp_send_json_error(array('message'=>'Доступ заборонено.'),403);
+        if (!$this->has_manager_role()) wp_send_json_error(array('message'=>'Доступ заборонено.'),403);
         check_ajax_referer('gcm_email_check');
         $email=sanitize_email(wp_unslash($_POST['email'] ?? ''));
         if (!$email || !is_email($email)) wp_send_json_error(array('message'=>'Вкажіть коректний email.'),400);
@@ -320,6 +606,27 @@ final class GMaps_Client_Manager {
         if ($method==='cash') return 'Готівка';
         if ($method==='card') return 'Картка / Приват Конверт';
         return 'Не вказано';
+    }
+
+    private function request_status_label($status) {
+        $labels = array(
+            'pending_review'=>'Очікує перевірки',
+            'needs_creation'=>'Потрібно створити карту',
+            'invite_failed'=>'Запрошення не надіслано',
+            'invited'=>'Запрошення надіслано, очікує прийняття',
+        );
+        return $labels[$status] ?? 'Нова заявка';
+    }
+
+    private function request_attachments($json) {
+        $ids = json_decode($json, true);
+        if (!is_array($ids)) return '';
+        $links = array();
+        foreach ($ids as $index => $id) {
+            $url = wp_get_attachment_url(absint($id));
+            if ($url) $links[] = '<a href="' . esc_url($url) . '" target="_blank" rel="noopener">Файл ' . (int)($index + 1) . '</a>';
+        }
+        return implode('<br>', $links);
     }
 
     private function upload_order_media($field_names) {
@@ -379,24 +686,34 @@ final class GMaps_Client_Manager {
         register_setting('gcm_settings_group', 'gcm_currency', array('sanitize_callback'=>'sanitize_text_field'));
     }
     public function sanitize_settings($in) {
-        return array('client_id'=>sanitize_text_field($in['client_id'] ?? ''),'client_secret'=>sanitize_text_field($in['client_secret'] ?? ''),'redirect_uri'=>esc_url_raw($in['redirect_uri'] ?? $this->google_redirect_uri()));
+        return array('client_id'=>sanitize_text_field($in['client_id'] ?? ''),'client_secret'=>sanitize_text_field($in['client_secret'] ?? ''),'redirect_uri'=>esc_url_raw($in['redirect_uri'] ?? $this->google_redirect_uri()),'places_api_key'=>sanitize_text_field($in['places_api_key'] ?? ''));
     }
     private function google_redirect_uri() { return admin_url('admin-post.php?action=gcm_google_callback'); }
     public function settings_page() {
         $s=get_option(self::OPT,array()); ?>
         <div class="wrap"><h1>GMaps Client Manager — налаштування</h1><form method="post" action="options.php"><?php settings_fields('gcm_settings_group'); ?>
-        <table class="form-table"><tr><th>Google OAuth Client ID</th><td><input class="regular-text" name="<?php echo esc_attr(self::OPT); ?>[client_id]" value="<?php echo esc_attr($s['client_id'] ?? ''); ?>"></td></tr>
+        <table class="form-table"><tr><th>Google Places API key</th><td><input class="regular-text" type="password" autocomplete="new-password" name="<?php echo esc_attr(self::OPT); ?>[places_api_key]" value="<?php echo esc_attr($s['places_api_key'] ?? ''); ?>"><p class="description">Використовується сервером для пошуку Google Maps. Увімкніть Places API та billing у Google Cloud.</p></td></tr>
+        <tr><th>Google OAuth Client ID</th><td><input class="regular-text" name="<?php echo esc_attr(self::OPT); ?>[client_id]" value="<?php echo esc_attr($s['client_id'] ?? ''); ?>"></td></tr>
         <tr><th>Google OAuth Client Secret</th><td><input class="regular-text" type="password" name="<?php echo esc_attr(self::OPT); ?>[client_secret]" value="<?php echo esc_attr($s['client_secret'] ?? ''); ?>" autocomplete="new-password"></td></tr>
         <tr><th>Redirect URI</th><td><input class="regular-text" readonly value="<?php echo esc_attr($this->google_redirect_uri()); ?>"><p class="description">Додайте цю адресу в Authorized redirect URIs у Google Cloud Console.</p></td></tr>
         <tr><th>Валюта</th><td><input name="gcm_currency" value="<?php echo esc_attr(get_option('gcm_currency','грн')); ?>"></td></tr></table><?php submit_button(); ?></form>
+        <h2>Центральний Google Business Profile</h2>
+        <p>Підключіть один Google-акаунт адміністратора, який має доступ до потрібних карт. Менеджерам окрема Google-авторизація не потрібна.</p>
+        <?php $token=get_option('gcm_google_admin_token',array()); if(!empty($token['refresh_token'])): ?><p><strong>Google-акаунт підключено.</strong></p><?php else: ?><p>Google-акаунт ще не підключено.</p><?php endif; ?>
+        <a class="button button-primary" href="<?php echo esc_url(wp_nonce_url(admin_url('admin-post.php?action=gcm_google_admin_connect'),'gcm_google_admin_connect')); ?>">Підключити Google-акаунт адміністратора</a>
         <p><strong>Потрібно:</strong> увімкнути Google Business Profile API та налаштувати OAuth consent screen у Google Cloud. Ключі зберігаються лише в налаштуваннях сайту.</p></div><?php
     }
 
     public function admin_page() {
         global $wpdb; $orders=$wpdb->get_results("SELECT o.*,c.name client_name,u.display_name manager_name FROM {$this->tables['orders']} o LEFT JOIN {$this->tables['clients']} c ON c.id=o.client_id LEFT JOIN {$wpdb->users} u ON u.ID=o.manager_id ORDER BY o.id DESC");
         $payments=$wpdb->get_results("SELECT p.*,o.service,u.display_name manager_name FROM {$this->tables['payments']} p LEFT JOIN {$this->tables['orders']} o ON o.id=p.order_id LEFT JOIN {$wpdb->users} u ON u.ID=p.manager_id ORDER BY p.id DESC");
+        $requests=$wpdb->get_results("SELECT * FROM {$wpdb->prefix}gcm_requests ORDER BY id DESC LIMIT 100");
         $managers=get_users(array('role'=>self::ROLE)); ?>
         <div class="wrap"><h1>GMaps Client Manager</h1>
+        <h2>Заявки клієнтів</h2>
+        <table class="widefat striped"><thead><tr><th>#</th><th>Клієнт</th><th>Бізнес</th><th>Тип</th><th>Менеджер</th><th>Карта</th><th>Коментар</th><th>Матеріали</th><th>Статус</th><th>Дія</th><th>Створено</th></tr></thead><tbody>
+        <?php if($requests) foreach($requests as $request): ?><tr><td><?php echo (int)$request->id; ?></td><td><?php echo esc_html($request->customer_email); ?></td><td><?php echo esc_html($request->business_name.' '.$request->business_address); ?></td><td><?php echo esc_html($request->request_type==='edit'?'Редагування':'Створення'); ?></td><td><?php echo esc_html($request->manager_email); ?></td><td><?php if($request->maps_url): ?><a href="<?php echo esc_url($request->maps_url); ?>" target="_blank" rel="noopener">Відкрити</a><?php endif; ?></td><td><?php echo esc_html($request->notes); ?></td><td><?php echo $this->request_attachments($request->media); ?></td><td><?php echo esc_html($this->request_status_label($request->status)); ?><?php if($request->last_error): ?><br><span class="description"><?php echo esc_html($request->last_error); ?></span><?php endif; ?></td><td><?php if($request->request_type==='edit' && $request->status!=='invited'): ?><form method="post" action="<?php echo esc_url(admin_url('admin-post.php')); ?>"><?php wp_nonce_field('gcm_admin'); ?><input type="hidden" name="action" value="gcm_action"><input type="hidden" name="gcm_do" value="invite_request"><input type="hidden" name="request_id" value="<?php echo (int)$request->id; ?>"><button class="button button-primary">Надіслати запрошення</button></form><?php elseif($request->request_type==='create'): ?>Створити профіль у Google Business Profile<?php else: ?>Запрошення надіслано<?php endif; ?></td><td><?php echo esc_html($request->created_at); ?></td></tr><?php endforeach; ?>
+        <?php if(!$requests) echo '<tr><td colspan="11">Заявок поки немає.</td></tr>'; ?></tbody></table>
         <h2>Менеджери</h2><p>Призначайте роль <code>GMaps Manager</code> користувачам у стандартному профілі WordPress.</p>
         <table class="widefat striped"><thead><tr><th>Менеджер</th><th>Email</th><th>Баланс комісії</th></tr></thead><tbody>
         <?php foreach($managers as $m): $earned=(float)$wpdb->get_var($wpdb->prepare("SELECT COALESCE(SUM(commission),0) FROM {$this->tables['payments']} WHERE manager_id=%d AND status='confirmed'",$m->ID)); $paid=(float)$wpdb->get_var($wpdb->prepare("SELECT COALESCE(SUM(amount),0) FROM {$this->tables['payouts']} WHERE manager_id=%d",$m->ID)); ?>
@@ -422,7 +739,19 @@ final class GMaps_Client_Manager {
         if (!current_user_can('manage_options')) wp_die('Доступ заборонено.');
         check_admin_referer('gcm_admin');
         global $wpdb; $do=sanitize_key($_POST['gcm_do'] ?? '');
-        if ($do==='add_payment') {
+        if ($do==='invite_request') {
+            $request_id = absint($_POST['request_id'] ?? 0);
+            $request = $wpdb->get_row($wpdb->prepare("SELECT * FROM {$wpdb->prefix}gcm_requests WHERE id=%d", $request_id));
+            if (!$request || $request->request_type !== 'edit') wp_die('Заявку на редагування не знайдено.');
+            $invitation = $this->send_google_location_invitation($request->place_id, $request->manager_email);
+            if (is_wp_error($invitation)) {
+                $wpdb->update($wpdb->prefix . 'gcm_requests', array('status'=>'invite_failed', 'last_error'=>$invitation->get_error_message()), array('id'=>$request_id));
+            } else {
+                $wpdb->update($wpdb->prefix . 'gcm_requests', array('status'=>'invited', 'last_error'=>''), array('id'=>$request_id));
+            }
+            wp_safe_redirect(admin_url('admin.php?page=gcm-dashboard'));
+            exit;
+        } elseif ($do==='add_payment') {
             $oid=absint($_POST['order_id']); $order=$wpdb->get_row($wpdb->prepare("SELECT * FROM {$this->tables['orders']} WHERE id=%d",$oid));
             if ($order) {
                 $amount=max(0,(float)$_POST['amount']);
@@ -444,30 +773,55 @@ final class GMaps_Client_Manager {
         wp_safe_redirect(admin_url('admin.php?page=gcm-dashboard')); exit;
     }
 
-    private function google_auth_url($uid) {
-        $s=get_option(self::OPT,array());
-        $redirect=$s['redirect_uri'] ?? $this->google_redirect_uri();
-        $state=wp_create_nonce('gcm_google_'.$uid);
-        set_transient('gcm_google_state_'.$uid,$state,10*MINUTE_IN_SECONDS);
-        return add_query_arg(array('client_id'=>$s['client_id'],'redirect_uri'=>$redirect,'response_type'=>'code','scope'=>'https://www.googleapis.com/auth/business.manage','access_type'=>'offline','prompt'=>'consent','state'=>$uid.'.'.$state), 'https://accounts.google.com/o/oauth2/v2/auth');
+    public function start_google_admin_connect() {
+        if (!current_user_can('manage_options')) wp_die('Доступ заборонено.');
+        check_admin_referer('gcm_google_admin_connect');
+        $settings = get_option(self::OPT, array());
+        if (empty($settings['client_id']) || empty($settings['client_secret'])) wp_die('Спочатку введіть Google OAuth Client ID та Client Secret у налаштуваннях.');
+        $uid = get_current_user_id();
+        $state = wp_generate_password(32, false, false);
+        set_transient('gcm_google_admin_state_' . $uid, $state, 10 * MINUTE_IN_SECONDS);
+        $url = add_query_arg(array(
+            'client_id'=>$settings['client_id'],
+            'redirect_uri'=>$this->google_redirect_uri(),
+            'response_type'=>'code',
+            'scope'=>'https://www.googleapis.com/auth/business.manage',
+            'access_type'=>'offline',
+            'prompt'=>'consent',
+            'state'=>$uid . '.' . $state,
+        ), 'https://accounts.google.com/o/oauth2/v2/auth');
+        wp_redirect($url);
+        exit;
     }
 
     public function google_callback() {
-        $state=sanitize_text_field(wp_unslash($_GET['state'] ?? ''));
-        $parts=explode('.',$state,2); $uid=absint($parts[0] ?? 0); $nonce=$parts[1] ?? '';
-        if (!$uid || !$nonce || get_transient('gcm_google_state_'.$uid)!==$nonce || !wp_verify_nonce($nonce,'gcm_google_'.$uid)) wp_die('Недійсний стан OAuth.');
-        delete_transient('gcm_google_state_'.$uid);
-        if (!empty($_GET['error'])) wp_die('Google не завершив авторизацію: '.esc_html(sanitize_text_field(wp_unslash($_GET['error']))));
-        $code=sanitize_text_field(wp_unslash($_GET['code'] ?? ''));
-        $s=get_option(self::OPT,array());
-        if (!$code || empty($s['client_id']) || empty($s['client_secret'])) wp_die('OAuth не налаштований.');
-        $response=wp_remote_post('https://oauth2.googleapis.com/token',array('timeout'=>20,'body'=>array('code'=>$code,'client_id'=>$s['client_id'],'client_secret'=>$s['client_secret'],'redirect_uri'=>$s['redirect_uri'] ?? $this->google_redirect_uri(),'grant_type'=>'authorization_code')));
+        if (!current_user_can('manage_options')) wp_die('Лише адміністратор може підключити центральний Google-акаунт.');
+        $state = sanitize_text_field(wp_unslash($_GET['state'] ?? ''));
+        $parts = explode('.', $state, 2);
+        $uid = absint($parts[0] ?? 0);
+        $nonce = $parts[1] ?? '';
+        if ($uid !== get_current_user_id() || !$nonce || get_transient('gcm_google_admin_state_' . $uid) !== $nonce) wp_die('Недійсний стан OAuth.');
+        delete_transient('gcm_google_admin_state_' . $uid);
+        if (!empty($_GET['error'])) wp_die('Google не завершив авторизацію: ' . esc_html(sanitize_text_field(wp_unslash($_GET['error']))));
+        $code = sanitize_text_field(wp_unslash($_GET['code'] ?? ''));
+        $settings = get_option(self::OPT, array());
+        if (!$code || empty($settings['client_id']) || empty($settings['client_secret'])) wp_die('OAuth не налаштований.');
+        $response = wp_remote_post('https://oauth2.googleapis.com/token', array('timeout'=>20, 'body'=>array(
+            'code'=>$code,
+            'client_id'=>$settings['client_id'],
+            'client_secret'=>$settings['client_secret'],
+            'redirect_uri'=>$this->google_redirect_uri(),
+            'grant_type'=>'authorization_code',
+        )));
         if (is_wp_error($response)) wp_die(esc_html($response->get_error_message()));
-        $body=json_decode(wp_remote_retrieve_body($response),true);
-        if (empty($body['access_token'])) wp_die('Google не повернув access token. Перевірте налаштування OAuth.');
-        update_user_meta($uid,'gcm_google_token',$body);
-        wp_safe_redirect(home_url('/gmaps/?gcm_msg='.rawurlencode('Google-акаунт менеджера підключено.'))); exit;
+        $body = json_decode(wp_remote_retrieve_body($response), true);
+        if (empty($body['access_token']) || empty($body['refresh_token'])) wp_die('Google не повернув refresh token. Повторіть підключення та дозвольте офлайн-доступ.');
+        $body['expires_at'] = time() + absint($body['expires_in'] ?? 3600);
+        update_option('gcm_google_admin_token', $body, false);
+        wp_safe_redirect(admin_url('admin.php?page=gcm-settings&gcm_google=connected'));
+        exit;
     }
+
 }
 GMaps_Client_Manager::instance();
 
