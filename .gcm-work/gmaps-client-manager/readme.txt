@@ -1,4 +1,4 @@
-# GMaps Client Manager 1.1.0
+# GMaps Client Manager 1.2.0
 
 WordPress CRM for Google Business Profile service managers.
 
