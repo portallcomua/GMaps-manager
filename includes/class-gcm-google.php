@@ -1,3 +1,4 @@
+
 <?php
 if (!defined('ABSPATH')) exit;
 
@@ -528,6 +529,127 @@ final class GCM_Google {
             'gcm_no_access',
             'Центральний Google-акаунт поки не має доступу до цієї картки.'
         );
+    }
+
+    /**
+     * Отримує стан картки через Business Profile API v4.
+     *
+     * v1 Business Information API не повертає LocationState.
+     * Для стану картки використовуємо v4 ресурс
+     * accounts/{accountId}/locations/{locationId}.
+     *
+     * @param string $account  accounts/{accountId} або числовий ID.
+     * @param string $location locations/{locationId} або числовий ID.
+     * @return array|WP_Error
+     */
+    public static function get_location_state($account, $location) {
+        $account = trim((string)$account);
+        $location = trim((string)$location);
+
+        if (preg_match('/^[0-9]+$/', $account)) {
+            $account = 'accounts/' . $account;
+        }
+
+        if (preg_match('/^[0-9]+$/', $location)) {
+            $location = 'locations/' . $location;
+        }
+
+        if (!preg_match('~^accounts/[0-9]+$~', $account)) {
+            return new WP_Error(
+                'gcm_account',
+                'Некоректний Google Business Profile account ID.'
+            );
+        }
+
+        if (!preg_match('~^locations/[^/]+$~', $location)) {
+            return new WP_Error(
+                'gcm_location',
+                'Некоректний Google Business Profile location ID.'
+            );
+        }
+
+        $location_id = substr($location, strlen('locations/'));
+        $resource = $account . '/locations/' . $location_id;
+
+        $url = self::V4 . $resource .
+            '?fields=' . rawurlencode('name,locationState');
+
+        $result = self::request('GET', $url);
+
+        if (is_wp_error($result)) {
+            return $result;
+        }
+
+        if (!isset($result['locationState']) || !is_array($result['locationState'])) {
+            return new WP_Error(
+                'gcm_location_state_missing',
+                'Google не повернув стан картки. Перевірте доступ до акаунта та Location ID.'
+            );
+        }
+
+        return $result['locationState'];
+    }
+
+    /**
+     * Видаляє картку через Business Profile API v4.
+     *
+     * Google дозволяє видалення через API лише тоді, коли
+     * locationState.canDelete має значення true.
+     *
+     * @param string $account  accounts/{accountId} або числовий ID.
+     * @param string $location locations/{locationId} або числовий ID.
+     * @return true|WP_Error
+     */
+    public static function delete_location($account, $location) {
+        $account = trim((string)$account);
+        $location = trim((string)$location);
+
+        if (preg_match('/^[0-9]+$/', $account)) {
+            $account = 'accounts/' . $account;
+        }
+
+        if (preg_match('/^[0-9]+$/', $location)) {
+            $location = 'locations/' . $location;
+        }
+
+        if (!preg_match('~^accounts/[0-9]+$~', $account)) {
+            return new WP_Error(
+                'gcm_account',
+                'Некоректний Google Business Profile account ID.'
+            );
+        }
+
+        if (!preg_match('~^locations/[^/]+$~', $location)) {
+            return new WP_Error(
+                'gcm_location',
+                'Некоректний Google Business Profile location ID.'
+            );
+        }
+
+        $state = self::get_location_state($account, $location);
+
+        if (is_wp_error($state)) {
+            return $state;
+        }
+
+        if (empty($state['canDelete'])) {
+            return new WP_Error(
+                'gcm_location_cannot_delete',
+                'Google не дозволяє видалити цю картку через API. Перевірте її стан у Business Profile.'
+            );
+        }
+
+        $location_id = substr($location, strlen('locations/'));
+        $resource = $account . '/locations/' . $location_id;
+
+        $url = self::V4 . $resource;
+        $result = self::request('DELETE', $url);
+
+        if (is_wp_error($result)) {
+            return $result;
+        }
+
+        return true;
     }
 
     public static function get_location($location, $mask) {
