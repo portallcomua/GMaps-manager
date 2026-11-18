@@ -341,10 +341,10 @@ final class GCM_Front {
 
     private function my_where() {
         global $wpdb;
-
-        return GCM_Core::is_admin_user()
-            ? '1=1'
-            : $wpdb->prepare('o.manager_id=%d', get_current_user_id());
+        if (GCM_Core::is_admin_user()) return '1=1';
+        $uid = absint(get_current_user_id());
+        if (!$uid || !GCM_Core::can_manage()) return '1=0';
+        return $wpdb->prepare('o.manager_id=%d', $uid);
     }
 
     private function cases_html() {
@@ -397,12 +397,22 @@ final class GCM_Front {
         $cl = GCM_Core::t('clients');
         $o = GCM_Core::t('orders');
 
-        $where = GCM_Core::is_admin_user()
-            ? '1=1'
-            : $wpdb->prepare('c.manager_id=%d', get_current_user_id());
+        if (GCM_Core::is_admin_user()) {
+            $where = '1=1';
+            $count_where = 'client_id=c.id';
+        } else {
+            $uid = absint(get_current_user_id());
+            if (!$uid || !GCM_Core::can_manage()) {
+                $where = '1=0';
+                $count_where = 'client_id=c.id AND manager_id=0';
+            } else {
+                $where = $wpdb->prepare('c.manager_id=%d', $uid);
+                $count_where = $wpdb->prepare('client_id=c.id AND manager_id=%d', $uid);
+            }
+        }
 
         $rows = $wpdb->get_results(
-            "SELECT c.*, (SELECT COUNT(*) FROM $o WHERE client_id=c.id) cnt
+            "SELECT c.*, (SELECT COUNT(*) FROM $o WHERE $count_where) cnt
             FROM $cl c
             WHERE $where
             ORDER BY c.id DESC LIMIT 300"
@@ -429,8 +439,7 @@ final class GCM_Front {
 
         return ob_get_clean();
     }
-
-    /* ---------- Форма роботи ---------- */
+     /* ---------- Форма роботи ---------- */
 
     private function v($case, $f, $d = '') {
         return $case && isset($case->$f) ? $case->$f : $d;
@@ -788,7 +797,7 @@ final class GCM_Front {
         }
 
         // Медіа
-        $existing = $case ? GCM_Core::media_ids($case->media) : array();
+            $existing = $case ? GCM_Core::media_ids($case->media) : array();
 
         if ($case && !empty($_POST['remove_media']) && is_array($_POST['remove_media'])) {
             $rm = array_intersect(array_map('absint', $_POST['remove_media']), $existing);
@@ -1270,6 +1279,87 @@ final class GCM_Front {
 
         wp_die('Невідома дія.');
     }
+            if ($do === 'save_case') {
+            $this->save_case();
+        }
+
+        $this->verify();
+
+        $case = GCM_Core::get_case(absint($_POST['case_id'] ?? 0));
+
+        if (!GCM_Core::user_owns_case($case)) {
+            wp_die('Доступ заборонено.');
+        }
+
+        $to = array('gcm_tab' => 'case', 'id' => $case->id);
+        $client = GCM_Core::get_client($case->client_id);
+
+        if ($do === 'report_payment') {
+            $r = GCM_Core::add_payment(
+                $case,
+                (float)str_replace(',', '.', (string)wp_unslash($_POST['amount'] ?? '0')),
+                sanitize_key($_POST['method'] ?? ''),
+                wp_unslash($_POST['note'] ?? '')
+            );
+
+            if (is_wp_error($r)) {
+                $this->back($to, $r->get_error_message(), 'err');
+            }
+
+            $this->back($to, 'Оплату записано. Вона з’явиться в «Гроші та комісія» і чекає підтвердження адміністратора.');
+        }
+
+        if ($do === 'publish') {
+            if (!$this->limit('pub' . $case->id, 3, MINUTE_IN_SECONDS)) {
+                $this->back($to, 'Зачекайте хвилину перед наступною спробою.', 'err');
+            }
+
+            $res = GCM_Publisher::publish($case, false);
+
+            $this->back(
+                $to,
+                implode(' ', $res['lines']),
+                $res['ok'] ? 'ok' : 'err'
+            );
+        }
+
+        if ($do === 'request_access') {
+            $sent = GCM_Publisher::send_access_email($case, $client);
+
+            $this->back(
+                $to,
+                $sent
+                    ? 'Інструкцію надіслано клієнту на ' . $client->email . '.'
+                    : 'Не вдалося надіслати лист. Скопіюйте посилання й надішліть клієнту самостійно.',
+                $sent ? 'ok' : 'err'
+            );
+        }
+
+        if ($do === 'check_access') {
+            if (!$this->limit('chk' . $case->id, 6, 10 * MINUTE_IN_SECONDS)) {
+                $this->back($to, 'Забагато перевірок. Спробуйте за кілька хвилин.', 'err');
+            }
+
+            $accepted = GCM_Publisher::auto_accept($case);
+            $loc = GCM_Publisher::check_access($case);
+
+            if (is_wp_error($loc)) {
+                $this->back(
+                    $to,
+                    ($accepted ? 'Запрошення прийнято, але доступ ще не оновився — спробуйте за кілька хвилин. ' : '') .
+                    $loc->get_error_message(),
+                    'err'
+                );
+            }
+
+            $this->back(
+                $to,
+                'Доступ є: ' . ($loc['title'] ?: 'картка підключена') . '. Можна публікувати.'
+            );
+        }
+
+        wp_die('Невідома дія.');
+    }
 
     /* ---------- AJAX ---------- */
 
@@ -1302,13 +1392,28 @@ final class GCM_Front {
 
         global $wpdb;
 
-        $cases = $wpdb->get_results($wpdb->prepare(
-            "SELECT id,biz_name,place_id,maps_url,request_type,status
-            FROM " . GCM_Core::t('orders') . "
-            WHERE client_id=%d
-            ORDER BY id DESC LIMIT 5",
-            $cl->id
-        ));
+        if (GCM_Core::is_admin_user()) {
+            $cases = $wpdb->get_results($wpdb->prepare(
+                "SELECT id,biz_name,place_id,maps_url,request_type,status
+                FROM " . GCM_Core::t('orders') . "
+                WHERE client_id=%d
+                ORDER BY id DESC LIMIT 5",
+                $cl->id
+            ));
+        } else {
+            $uid = absint(get_current_user_id());
+            if (!$uid || !GCM_Core::can_manage()) {
+                wp_send_json_success(array('state' => 'other'));
+            }
+            $cases = $wpdb->get_results($wpdb->prepare(
+                "SELECT id,biz_name,place_id,maps_url,request_type,status
+                FROM " . GCM_Core::t('orders') . "
+                WHERE client_id=%d AND manager_id=%d
+                ORDER BY id DESC LIMIT 5",
+                $cl->id,
+                $uid
+            ));
+        }
 
         $out = array();
 
