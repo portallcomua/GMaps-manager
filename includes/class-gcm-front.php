@@ -494,14 +494,25 @@ final class GCM_Front {
             <p id="gcm-client-result" class="gcm-muted" aria-live="polite">Введіть email — перевірю, чи вже є такий клієнт і чи є в нього робота.</p>
           </div>
           <?php else: ?>
-          <div class="gcm-box">
-            <h3>Клієнт</h3>
-            <p><strong><?php echo esc_html($client ? $client->name : ''); ?></strong> <span class="gcm-muted"><?php echo esc_html($client ? $client->email : ''); ?></span></p>
-            <?php if ($client && !empty($client->google_email)): ?>
-              <p class="gcm-muted">Google email: <?php echo esc_html($client->google_email); ?></p>
-            <?php endif; ?>
-          </div>
-          <?php endif; ?>
+<div class="gcm-box">
+    <h3>Клієнт</h3>
+    <p>
+        <strong><?php echo esc_html($client ? $client->name : ''); ?></strong>
+        <span class="gcm-muted"><?php echo esc_html($client ? $client->email : ''); ?></span>
+    </p>
+    <label>Google email клієнта
+        <input
+            type="email"
+            name="google_email"
+            id="gcm-google-email"
+            value="<?php echo esc_attr($client ? $client->google_email : ''); ?>"
+            autocomplete="off"
+            placeholder="name@gmail.com"
+        >
+        <span class="gcm-muted">Google-акаунт, який керує карткою бізнесу. Порожнє поле не видалить попередню адресу.</span>
+    </label>
+</div>
+<?php endif; ?>
 
           <div class="gcm-box">
             <h3><?php echo $case ? '' : '3. '; ?>Картка на Google</h3>
@@ -695,9 +706,35 @@ final class GCM_Front {
             : ((sanitize_key($_POST['kind'] ?? 'map') === 'reviews') ? 'reviews' : 'map');
 
         // Клієнт
-        if ($case) {
-            $client = GCM_Core::get_client($case->client_id);
-        } else {
+if ($case) {
+    $client = GCM_Core::get_client($case->client_id);
+
+    $google_email = sanitize_email(
+        wp_unslash($_POST['google_email'] ?? '')
+    );
+
+    if ($google_email !== '' && !is_email($google_email)) {
+        $fail('Вкажіть коректний Google email або залиште поле порожнім.');
+    }
+
+    if ($client && $google_email !== '') {
+        $updated = $wpdb->update(
+            $cT,
+            array(
+                'google_email' => $google_email
+            ),
+            array(
+                'id' => (int)$client->id
+            )
+        );
+
+        if ($updated === false) {
+            $fail('Не вдалося зберегти Google email клієнта.');
+        }
+
+        $client = GCM_Core::get_client($client->id);
+    }
+} else {
             $email = sanitize_email(wp_unslash($_POST['client_email'] ?? ''));
             $cname = sanitize_text_field(wp_unslash($_POST['client_name'] ?? ''));
             $phone = sanitize_text_field(wp_unslash($_POST['client_phone'] ?? ''));
