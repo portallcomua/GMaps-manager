@@ -447,7 +447,6 @@ final class GCM_Front {
 
     private function work_form_html() {
         $case = null;
-
         if (!empty($_GET['id'])) {
             $case = GCM_Core::get_case(absint($_GET['id']));
 
@@ -487,6 +486,10 @@ final class GCM_Front {
               <label>Email клієнта<input required type="email" name="client_email" id="gcm-email" value="<?php echo esc_attr($email); ?>" autocomplete="off"></label>
               <label>Ім’я / назва клієнта<input required name="client_name" id="gcm-cname"></label>
               <label>Телефон<input name="client_phone" id="gcm-cphone" type="tel"></label>
+              <label>Google email клієнта
+                <input type="email" name="google_email" id="gcm-google-email" autocomplete="off" placeholder="name@gmail.com">
+                <span class="gcm-muted">Google-акаунт, який керує карткою бізнесу. Можна вказати пізніше.</span>
+              </label>
             </div>
             <p id="gcm-client-result" class="gcm-muted" aria-live="polite">Введіть email — перевірю, чи вже є такий клієнт і чи є в нього робота.</p>
           </div>
@@ -494,6 +497,9 @@ final class GCM_Front {
           <div class="gcm-box">
             <h3>Клієнт</h3>
             <p><strong><?php echo esc_html($client ? $client->name : ''); ?></strong> <span class="gcm-muted"><?php echo esc_html($client ? $client->email : ''); ?></span></p>
+            <?php if ($client && !empty($client->google_email)): ?>
+              <p class="gcm-muted">Google email: <?php echo esc_html($client->google_email); ?></p>
+            <?php endif; ?>
           </div>
           <?php endif; ?>
 
@@ -646,8 +652,7 @@ final class GCM_Front {
             </div>
           </div>
           <?php endif; ?>
-
-          <div class="gcm-box">
+                  <div class="gcm-box">
             <label>Примітки<textarea name="notes" rows="2"><?php echo esc_textarea($this->v($case, 'notes')); ?></textarea></label>
           </div>
 
@@ -695,9 +700,15 @@ final class GCM_Front {
         } else {
             $email = sanitize_email(wp_unslash($_POST['client_email'] ?? ''));
             $cname = sanitize_text_field(wp_unslash($_POST['client_name'] ?? ''));
+            $phone = sanitize_text_field(wp_unslash($_POST['client_phone'] ?? ''));
+            $google_email = sanitize_email(wp_unslash($_POST['google_email'] ?? ''));
 
             if (!is_email($email) || $cname === '') {
                 $fail('Вкажіть email та ім’я клієнта.');
+            }
+
+            if ($google_email !== '' && !is_email($google_email)) {
+                $fail('Вкажіть коректний Google email або залиште поле порожнім.');
             }
 
             $client = GCM_Core::client_by_email($email);
@@ -707,15 +718,42 @@ final class GCM_Front {
             }
 
             if (!$client) {
-                $wpdb->insert($cT, array(
+                $inserted = $wpdb->insert($cT, array(
                     'manager_id' => $uid,
                     'name' => $cname,
                     'email' => $email,
-                    'phone' => sanitize_text_field(wp_unslash($_POST['client_phone'] ?? '')),
+                    'phone' => $phone,
+                    'google_email' => $google_email,
                     'created_at' => current_time('mysql')
                 ));
 
+                if (!$inserted) {
+                    $fail('Не вдалося зберегти клієнта. Спробуйте ще раз.');
+                }
+
                 $client = GCM_Core::get_client($wpdb->insert_id);
+            } else {
+                // Оновлюємо дані наявного клієнта.
+                // Порожні поля не затирають раніше збережені значення.
+                $client_update = array(
+                    'name' => $cname
+                );
+
+                if ($phone !== '') {
+                    $client_update['phone'] = $phone;
+                }
+
+                if ($google_email !== '') {
+                    $client_update['google_email'] = $google_email;
+                }
+
+                $wpdb->update(
+                    $cT,
+                    $client_update,
+                    array('id' => (int)$client->id)
+                );
+
+                $client = GCM_Core::get_client($client->id);
             }
         }
 
@@ -797,7 +835,7 @@ final class GCM_Front {
         }
 
         // Медіа
-            $existing = $case ? GCM_Core::media_ids($case->media) : array();
+        $existing = $case ? GCM_Core::media_ids($case->media) : array();
 
         if ($case && !empty($_POST['remove_media']) && is_array($_POST['remove_media'])) {
             $rm = array_intersect(array_map('absint', $_POST['remove_media']), $existing);
@@ -896,8 +934,7 @@ final class GCM_Front {
     }
 
     /* ---------- Сторінка роботи ---------- */
-
-    private function case_html($id) {
+        private function case_html($id) {
         global $wpdb;
 
         $case = GCM_Core::get_case($id);
@@ -1279,7 +1316,7 @@ final class GCM_Front {
 
         wp_die('Невідома дія.');
     }
-      
+
     /* ---------- AJAX ---------- */
 
     private function ajax_guard() {
@@ -1351,6 +1388,7 @@ final class GCM_Front {
             'state' => 'mine',
             'name' => $cl->name,
             'phone' => $cl->phone,
+            'google_email' => !empty($cl->google_email) ? $cl->google_email : '',
             'cases' => $out
         ));
     }
@@ -1557,3 +1595,4 @@ final class GCM_Front {
         exit;
     }
 }
+    
