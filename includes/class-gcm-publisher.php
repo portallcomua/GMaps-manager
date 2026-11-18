@@ -226,6 +226,37 @@ final class GCM_Publisher {
     }
 
     /**
+     * Визначає Google Business Profile акаунт для створення картки.
+     *
+     * Якщо в налаштуваннях вказано location_group_id,
+     * використовує саме його як ресурс accounts/{ID}.
+     *
+     * Якщо поле не заповнене — повертає акаунт за замовчуванням.
+     */
+    public static function creation_account() {
+        $group_id = trim(
+            (string)GCM_Core::setting('location_group_id', '')
+        );
+
+        if ($group_id !== '') {
+            if (preg_match('/^[0-9]+$/', $group_id)) {
+                $group_id = 'accounts/' . $group_id;
+            }
+
+            if (!preg_match('/^accounts\/[0-9]+$/', $group_id)) {
+                return new WP_Error(
+                    'gcm_invalid_location_group',
+                    'Неправильний Location Group ID. Вкажіть числовий ID або accounts/ID.'
+                );
+            }
+
+            return $group_id;
+        }
+
+        return GCM_Google::default_account();
+    }
+
+    /**
      * Отримує Google email клієнта з таблиці клієнтів.
      */
     private static function client_google_email($case) {
@@ -420,7 +451,12 @@ final class GCM_Publisher {
                 );
             }
 
-            $account = GCM_Google::default_account();
+            /*
+             * ВАЖЛИВО:
+             * Беремо акаунт із location_group_id налаштувань.
+             * Якщо поле порожнє — використовується default_account().
+             */
+            $account = self::creation_account();
 
             if (is_wp_error($account)) {
                 if (!$validate) {
@@ -462,7 +498,8 @@ final class GCM_Publisher {
                 return array(
                     'ok' => true,
                     'lines' => array(
-                        'Google прийняв би створення нової картки.'
+                        'Google прийняв би створення нової картки в акаунті ' .
+                        $account . '.'
                     )
                 );
             }
@@ -494,6 +531,7 @@ final class GCM_Publisher {
             );
 
             $lines[] = 'Нову картку створено в Google.';
+            $lines[] = 'Акаунт створення: ' . $account . '.';
             $final_status = 'created';
         }
 
